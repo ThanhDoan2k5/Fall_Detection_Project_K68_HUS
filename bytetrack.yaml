@@ -1,0 +1,5 @@
+# bytetrack.yaml
+tracker_type: bytetrack
+track_thresh: 0.5
+track_buffer: 60  # Nhớ ID 60 frame khi bị che khuất
+match_thresh: 0.8

@@ -1,0 +1,6 @@
+*.mp4
+dataset_raw/
+*.pth
+__pycache__/
+.env
+.vscode/
