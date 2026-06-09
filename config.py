@@ -1,6 +1,6 @@
 # config.py
 CONFIG = {
-    'IP_CAMERA': "http://192.168.1.100:8080/video",
+    'IP_CAMERA': "http://192.168.5.103:8080/video",
     'WINDOW_SIZE': 30,
     'VOTE_THRESH': 4,                
     'CONFIDENCE_FALL': 0.60,         

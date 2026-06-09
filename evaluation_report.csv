@@ -1,0 +1,5 @@
+﻿Chỉ số Đánh giá (Metrics),Kết quả (%)
+Accuracy (Độ chính xác tổng thể),54.57
+Precision (Độ chuẩn xác - Ít báo giả),85.77
+Recall (Độ bao phủ - Ít bỏ sót),13.62
+F1-Score (Điểm trung bình hài hòa),23.51

@@ -1,121 +1,169 @@
-# main.py - FINAL STABLE VERSION
+# main.py - BẢN MULTI-VIDEO TỰ ĐỘNG XÓA LOG CŨ
 import cv2, torch, time, winsound, csv, numpy as np 
+import smtplib, threading
+from email.mime.text import MIMEText
 from collections import deque
 from ultralytics import YOLO
 from train_lstm import FallDetectionLSTM
 import mediapipe as mp
 
 from config import CONFIG
-from camera_utils import ThreadedCamera
 from ai_models import calculate_3d_spine_angle, calculate_spine_angle_yolo, normalize_keypoints
 
-# --- KHỞI TẠO ---
+# ==========================================
+# ⚙️ CẤU HÌNH EMAIL
+# ==========================================
+EMAIL_SENDER = "doanthanh2k5@gmail.com"        
+EMAIL_PASSWORD = "xbko hvdd flix tjxy"    
+EMAIL_RECEIVER = "quangthanhthanhthuy@gmail.com"   
+
+def send_email_async():
+    msg = MIMEText("CẢNH BÁO KHẨN CẤP: Hệ thống camera vừa phát hiện có người ngã. Yêu cầu kiểm tra ngay lập tức!")
+    msg['Subject'] = 'CẢNH BÁO: PHÁT HIỆN NGÃ (FALL DETECTED)'
+    msg['From'] = EMAIL_SENDER
+    msg['To'] = EMAIL_RECEIVER
+    try:
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+        server.quit()
+    except Exception as e:
+        pass 
+
+# --- KHỞI TẠO AI ---
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 yolo_model = YOLO('yolov8n-pose.pt')
 lstm_model = FallDetectionLSTM(input_size=34, hidden_size=64, num_layers=2, num_classes=3)
 lstm_model.load_state_dict(torch.load("fall_detection_lstm.pth", map_location=device))
 lstm_model.to(device).eval()
 
-mp_pose = mp.solutions.pose
-pose_estimator = mp_pose.Pose(static_image_mode=False, model_complexity=0, min_detection_confidence=0.5)
-
-# --- BIẾN TOÀN CỤC ---
-frame_queue = deque(maxlen=CONFIG['WINDOW_SIZE'])
-angle_history = deque(maxlen=15)
-ratio_history = deque(maxlen=15)
-fps_history = deque(maxlen=30)
-cx_history, cy_history = deque(maxlen=15), deque(maxlen=15)
-
-locked_id, lost_counter, MAX_LOST = None, 0, 60
-fall_vote, suspected_fall, fall_detected, block_new_fall, lying_frame_count = 0, False, False, False, 0
-prev_ang, prev_time, last_log_time, last_beep_time, alarm_start_time = 0.0, time.time(), time.time(), 0.0, 0.0
-head_y_prev, head_y_prev_time, head_stuck_counter = None, None, 0
-
-# --- SETUP LOGGING ---
+# --- FILE LOG (ĐÃ CHUYỂN SANG 'w' ĐỂ TỰ ĐỘNG XÓA FILE CŨ MỖI KHI CHẠY) ---
 log_file = open(CONFIG['CSV_LOG'], 'w', newline='')
 csv_writer = csv.writer(log_file)
-csv_writer.writerow(['timestamp', 'pred', 'p2', 'spine_angle', 'vote', 'state', 'lying_frames', 'block_status', 'fps', 'occlusion'])
+csv_writer.writerow(['video_name', 'timestamp', 'pred', 'state', 'lying_frames', 'fps']) # Ghi ngay header chuẩn
 
-cap = ThreadedCamera(CONFIG['IP_CAMERA'])
-time.sleep(2)
+# ==========================================
+# 🎥 DANH SÁCH VIDEO TEST
+# ==========================================
+video_paths = [
+    "normal_01.mp4", 
+    "fall_nghieng_01.mp4"
+]
 
-print("🚀 v3.2 FINAL - Hệ thống đang hoạt động ổn định!")
+print(f"🚀 Bắt đầu chạy chế độ ĐÁNH GIÁ theo chuỗi ({len(video_paths)} video)...")
+alarm_triggered_count = 0
+total_fps_history = []
 
-while True:
-    ret, frame = cap.read()
-    if not ret or frame is None: continue
-    frame = cv2.resize(frame, (640, 480))
-    
-    # --- TRACKING (ĐÃ FIX LỖI: Bỏ tham số tracker để dùng mặc định của thư viện) ---
-    results = yolo_model.track(frame, conf=0.5, half=(device=='cuda'), persist=True, verbose=False)
-    
-    found_target = False
-    curr_ang = prev_ang
-    occlusion_case = 'none'
-    
-    if results and len(results[0].boxes) > 0 and results[0].boxes.id is not None:
-        track_ids = results[0].boxes.id.int().cpu().tolist()
+for video_path in video_paths:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"❌ BỎ QUA: Không tìm thấy file '{video_path}'")
+        continue
         
-        # ID Locking: Bám theo ID khóa hoặc bắt thằng bự nhất
-        if locked_id in track_ids:
-            best_idx = track_ids.index(locked_id); lost_counter = 0; found_target = True
-        else:
-            boxes = results[0].boxes.xywh.cpu().numpy()
-            best_idx = np.argmax(boxes[:, 2] * boxes[:, 3]); locked_id = track_ids[best_idx]; found_target = True
+    print(f"\n▶️ ĐANG CHẠY VIDEO: {video_path}")
+    
+    frame_queue = deque(maxlen=CONFIG['WINDOW_SIZE'])
+    angle_history, fps_history = deque(maxlen=15), deque(maxlen=30)
+    cy_history = deque(maxlen=15) 
+    locked_id, lost_counter = None, 0
+    fall_vote, suspected_fall, fall_detected, lying_frame_count = 0, False, False, 0
+    prev_ang, prev_time = 0.0, time.time()
+    last_beep_time, last_email_time = 0.0, 0.0
+    MAX_LOST = 60
+
+    while True:
+        pred = 0 
+        ret, frame = cap.read()
+        
+        if not ret or frame is None: 
+            break
             
-        box = results[0].boxes.xywh[best_idx].cpu().numpy()
-        cx_history.append(box[0]/frame.shape[1]); cy_history.append(box[1]/frame.shape[0])
-        ratio_history.append(box[2] / box[3] if box[3] > 0 else 0)
+        frame = cv2.resize(frame, (640, 480))
+        results = yolo_model.track(frame, conf=0.5, persist=True, verbose=False)
+        annotated_frame = results[0].plot()
         
-        if results[0].keypoints is not None:
-            kpts = results[0].keypoints.xyn[best_idx].cpu().numpy()
-            curr_ang = calculate_spine_angle_yolo(kpts)
-            norm = normalize_keypoints(kpts, results[0].keypoints.conf[best_idx].cpu().numpy())
-            if norm is not None: frame_queue.append(norm)
+        curr_ang = prev_ang
+        occlusion_triggered = False 
         
-        cv2.putText(frame, f"Locked ID: {locked_id}", (int(box[0]-20), int(box[1]-20)), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-    else:
-        lost_counter += 1
-        # Gồng ID (Duy trì khóa nếu mất dấu dưới 20 frame)
-        if lost_counter < 20: found_target = True 
-        elif lost_counter > MAX_LOST: 
-            locked_id = None; curr_ang = prev_ang
-
-    angle_history.append(curr_ang)
-
-    # --- FORCE RESET: Đứng thẳng là reset ---
-    if curr_ang < 20.0 and (fall_detected or suspected_fall):
-        fall_detected, suspected_fall, fall_vote, block_new_fall = False, False, 0, False
-
-    # --- LOGIC HYBRID VETO (LSTM) ---
-    avg_ang = np.mean(angle_history) if angle_history else 0.0
-    if avg_ang < CONFIG['RESET_ANGLE_THRESH']: block_new_fall = False
-    
-    pred, p2 = 0, 0.0
-    if len(frame_queue) == CONFIG['WINDOW_SIZE'] and not fall_detected:
-        with torch.no_grad():
-            tensor = torch.tensor(np.array(frame_queue), dtype=torch.float32).unsqueeze(0).to(device)
-            preds = torch.softmax(lstm_model(tensor), dim=1)
-            pred, p2 = torch.argmax(preds, dim=1).item(), preds[0][2].item()
-            
-            is_leaning = (curr_ang > CONFIG['ANGLE_FALL']) or ((np.mean(ratio_history) if ratio_history else 0) > CONFIG['RATIO_FALL'])
-            if not suspected_fall:
-                if not block_new_fall and pred == 2 and p2 > CONFIG['CONFIDENCE_FALL'] and is_leaning:
-                    fall_vote += 1
-                else: fall_vote = max(0, fall_vote - 1)
-                if fall_vote >= CONFIG['VOTE_THRESH']: suspected_fall = True; lying_frame_count = 0
+        if results and len(results[0].boxes) > 0 and results[0].boxes.id is not None:
+            track_ids = results[0].boxes.id.int().cpu().tolist()
+            if locked_id in track_ids:
+                best_idx = track_ids.index(locked_id); lost_counter = 0
             else:
-                lying_frame_count += 1
-                if lying_frame_count >= CONFIG['LYING_FRAMES_THRESH']: fall_detected = True
+                boxes = results[0].boxes.xywh.cpu().numpy()
+                best_idx = np.argmax(boxes[:, 2] * boxes[:, 3]); locked_id = track_ids[best_idx]
+                
+            box = results[0].boxes.xywh[best_idx].cpu().numpy()
+            cy_history.append(box[1] / frame.shape[0])
+            
+            x_tl, y_tl = int(box[0] - box[2] / 2), int(box[1] - box[3] / 2)
+            cv2.putText(annotated_frame, f"ID: {locked_id}", (x_tl, max(20, y_tl - 10)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                
+            if results[0].keypoints is not None and results[0].keypoints.xyn.numel() > 0:
+                kpts = results[0].keypoints.xyn[best_idx].cpu().numpy()
+                curr_ang = calculate_spine_angle_yolo(kpts)
+                norm = normalize_keypoints(kpts, results[0].keypoints.conf[best_idx].cpu().numpy())
+                if norm is not None: frame_queue.append(norm)
+            else:
+                occlusion_triggered = True
+        else:
+            lost_counter += 1
+            if lost_counter < 15: occlusion_triggered = True 
+            if lost_counter > MAX_LOST: locked_id = None
 
-    # --- CẢNH BÁO ---
-    if fall_detected:
-        cv2.rectangle(frame, (0,0), (640,480), (0, 0, 255), 8)
-        cv2.putText(frame, "!!! NGA BAT TINH !!!", (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 2, (0,0,255), 5)
-        if time.time() - alarm_start_time > CONFIG['AUTO_RESET_TIME']: fall_detected = False
+        if occlusion_triggered and len(cy_history) >= 5:
+            v_y = cy_history[-1] - cy_history[-5] 
+            if v_y > 0.15 and not fall_detected:  
+                fall_detected = True
 
-    cv2.imshow("Main System", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'): break
+        angle_history.append(curr_ang)
+        if len(frame_queue) == CONFIG['WINDOW_SIZE'] and not fall_detected:
+            with torch.no_grad():
+                tensor = torch.tensor(np.array(frame_queue), dtype=torch.float32).unsqueeze(0).to(device)
+                preds = torch.softmax(lstm_model(tensor), dim=1)
+                pred = torch.argmax(preds, dim=1).item()
+                
+                if pred == 2: fall_vote = min(fall_vote + 2, 10)
+                else: fall_vote = max(0, fall_vote - 1)
+                
+                if fall_vote >= CONFIG['VOTE_THRESH']: suspected_fall = True
+                if suspected_fall:
+                    lying_frame_count += 1
+                    if lying_frame_count >= CONFIG['LYING_FRAMES_THRESH']: 
+                        fall_detected = True
+                        alarm_triggered_count += 1
+                        
+        if curr_ang < 20.0 and (fall_detected or suspected_fall):
+            fall_detected, suspected_fall, fall_vote, lying_frame_count = False, False, 0, 0
 
-cap.release(); cv2.destroyAllWindows()
+        fps = 1.0 / (time.time() - prev_time + 1e-6); prev_time = time.time()
+        fps_history.append(fps); total_fps_history.append(fps)
+        cv2.putText(annotated_frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(annotated_frame, f"File: {video_path}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
+        if fall_detected:
+            cv2.rectangle(annotated_frame, (0,0), (640,480), (0, 0, 255), 8)
+            cv2.putText(annotated_frame, "!!! PHAT HIEN NGA !!!", (120, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 4)
+            if time.time() - last_beep_time > 0.5:
+                winsound.Beep(2000, 200)
+                last_beep_time = time.time()
+            if time.time() - last_email_time > 60.0:
+                threading.Thread(target=send_email_async, daemon=True).start()
+                last_email_time = time.time()
+
+        cv2.imshow("Main System", annotated_frame)
+        
+        # LOG GHI CẢ TÊN FILE
+        csv_writer.writerow([video_path, time.time(), pred, ('ALARM' if fall_detected else 'NORMAL'), lying_frame_count, fps])
+        log_file.flush()
+
+        if cv2.waitKey(30) & 0xFF == ord('q'): 
+            break
+
+    cap.release()
+
+print(f"\n📊 SUMMARY TẤT CẢ VIDEO: {alarm_triggered_count} lần báo ngã")
+log_file.close()
+cv2.destroyAllWindows()
