@@ -56,4 +56,4 @@ Hiệu suất tổng thể của hệ thống phân loại hành vi lai được
 Cài đặt các thư viện phụ thuộc cần thiết cho luồng xử lý dữ liệu và mô hình AI. Mở terminal và chạy lệnh:
 
 ```bash
-pip install opencv-python numpy pandas torch torchvision ultralytics mediapipe secure-smtplib
+pip install ultralytics torch mediapipe numpy opencv-python pandas scikit-learn
